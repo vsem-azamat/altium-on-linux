@@ -52,26 +52,28 @@ install_file() {
 }
 
 load_bottle_dir "$BOTTLE"
+if [ "$BACKEND" = prefix ]; then WHERE="Prefix $BOTTLE_DIR"; else WHERE="Bottle '$BOTTLE'"; fi
 if find_altium "$ALTIUM_DIR"; then
-    say "Bottle '$BOTTLE' (runner $RUNNER), Altium in Program Files/Altium/$ALTIUM_DIR"
+    say "$WHERE (runner $RUNNER), Altium in Program Files/Altium/$ALTIUM_DIR"
 else
     [ -z "$ALTIUM_DIR" ] || die "Altium Designer not found in $AD (check --altium-dir)"
     AD=
-    say "Bottle '$BOTTLE' (runner $RUNNER), Altium not installed yet: preparing the bottle for the installer"
+    say "$WHERE (runner $RUNNER), Altium not installed yet: preparing it for the installer"
 fi
 if [ -n "$(bottle_pids)" ]; then
     [ "$DRY" = 1 ] || die "the bottle is running: close Altium or its installer (and wait a few seconds for Wine to exit)"
     echo "    (the bottle is running; a real install would stop here)"
 fi
-if pgrep -f '/app/bin/bottles( |$)' >/dev/null; then
+if [ "$BACKEND" = bottles ] && pgrep -f '/app/bin/bottles( |$)' >/dev/null; then
     [ "$DRY" = 1 ] || die "close the Bottles window first (it would overwrite the bottle's settings)"
     echo "    (Bottles is open; a real install would stop here)"
 fi
 
-# Run a Wine command in the bottle, inside the Bottles sandbox, and wait for wineserver.
+# Run a Wine command in the bottle (inside the Bottles sandbox for a bottle), and wait for
+# wineserver.
 wine_in_bottle() {
     # shellcheck disable=SC2016 # expanded by the inner bash, not here
-    quiet flatpak run --command=bash "$APP" -c \
+    quiet in_bottle_sandbox "$BOTTLE_DIR" bash -c \
         'WINEPREFIX="$1" WINEDEBUG=-all "$2/bin/wine" "${@:3}" && WINEPREFIX="$1" "$2/bin/wineserver" -w' \
         _ "$BOTTLE_DIR" "$RUNNER_DIR" "$@"
 }
@@ -104,13 +106,15 @@ run cp "$ROOT/build/VkLayer_altium_present_wait.so" "$ROOT/src/presentwait/VkLay
 # zero-size filter keeps 0x0 windows unmapped, which Hyprland would blow up to 800x800
 # (logs to $STAGE/logs/zero-size.log); the installer is 32-bit, so it comes in both, and
 # the dynamic loader picks the process's own through $LIB, which in the Bottles Flatpak
-# runtime is lib/x86_64-linux-gnu or lib/i386-linux-gnu ($PLATFORM would depend on the CPU).
+# runtime is lib/x86_64-linux-gnu or lib/i386-linux-gnu, and on an Arch host lib or lib32
+# (zero_size_lib_dirs; $PLATFORM would depend on the CPU).
 say "Installing the fd guard, the XRandR filter and the zero-size filter into $STAGE"
 run mkdir -p "$STAGE/fdguard" "$STAGE/logs"
 run cp "$ROOT/build/altium_fd_guard.so" "$ROOT/build/altium_xrandr_filter.so" "$STAGE/fdguard/"
-for arch in x86_64 i386; do
-    run mkdir -p "$STAGE/zerosize/lib/$arch-linux-gnu"
-    run cp "$ROOT/build/${arch/i386/i686}/altium_zero_size.so" "$STAGE/zerosize/lib/$arch-linux-gnu/"
+for pair in $(zero_size_lib_dirs); do
+    arch=${pair%%:*} dir=${pair#*:}
+    run mkdir -p "$STAGE/zerosize/$dir"
+    run cp "$ROOT/build/${arch/i386/i686}/altium_zero_size.so" "$STAGE/zerosize/$dir/"
 done
 # shellcheck disable=SC2016 # $LIB is for the dynamic loader
 PRELOAD=$STAGE/fdguard/altium_fd_guard.so:$STAGE/fdguard/altium_xrandr_filter.so:$STAGE/zerosize/'$LIB'/altium_zero_size.so
@@ -155,20 +159,43 @@ for reg in "${regs[@]}"; do
 done
 
 say "Setting bottle environment variables"
-quiet flatpak run --command=bottles-cli "$APP" edit -b "$BOTTLE" --env-var DOTNET_SYSTEM_GLOBALIZATION_USENLS=1
-quiet flatpak run --command=bottles-cli "$APP" edit -b "$BOTTLE" --env-var SteamAppId=altium
-quiet flatpak run --command=bottles-cli "$APP" edit -b "$BOTTLE" --env-var VK_ADD_IMPLICIT_LAYER_PATH="$STAGE/vulkan"
-quiet flatpak run --command=bottles-cli "$APP" edit -b "$BOTTLE" --env-var LD_PRELOAD="$PRELOAD"
+quiet bottle_set_env DOTNET_SYSTEM_GLOBALIZATION_USENLS 1
+quiet bottle_set_env SteamAppId altium
+quiet bottle_set_env VK_ADD_IMPLICIT_LAYER_PATH "$STAGE/vulkan"
+quiet bottle_set_env LD_PRELOAD "$PRELOAD"
 
 # Bottles lists a bottle's programs from their Start Menu shortcuts, but Altium's points at
 # X2.exe and the file is X2.EXE, which a case-sensitive file system does not match.
-if [ -n "$AD" ]; then
+if [ -n "$AD" ] && [ "$BACKEND" = bottles ]; then
     programs=$(flatpak run --command=bottles-cli "$APP" -j programs -b "$BOTTLE" 2>/dev/null || true)
     if ! python3 -c 'import json, sys
 sys.exit(0 if any(p.get("path") == sys.argv[1] for p in json.loads(sys.stdin.read() or "[]")) else 1)' \
         "$AD/X2.EXE" <<< "$programs" 2>/dev/null; then
         say "Adding Altium Designer to the bottle's programs"
         quiet flatpak run --command=bottles-cli "$APP" add -b "$BOTTLE" -n "Altium Designer" -p "$AD/X2.EXE"
+    fi
+fi
+
+# The prefix has no Bottles to start Altium from: an application launcher entry runs
+# scripts/run.sh instead.
+DESKTOP_FILE=${XDG_DATA_HOME:-$HOME/.local/share}/applications/altium-designer.desktop
+if [ -n "$AD" ] && [ "$BACKEND" = prefix ]; then
+    say "Adding Altium Designer to the application launcher ($DESKTOP_FILE)"
+    if [ "$DRY" = 0 ]; then
+        mkdir -p "$(dirname "$DESKTOP_FILE")"
+        cat > "$DESKTOP_FILE" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Altium Designer
+Comment=Altium Designer in Wine (altium-on-linux)
+Exec="$ROOT/scripts/run.sh" altium %f
+Icon=applications-engineering
+Terminal=false
+Categories=Development;Electronics;Engineering;
+StartupWMClass=steam_app_altium
+DESKTOP
+    else
+        echo "    + write $DESKTOP_FILE"
     fi
 fi
 
@@ -187,16 +214,26 @@ if [ "$DRY" = 0 ]; then
         check_file "SHFolder.dll proxy" "$ROOT/build/SHFolder.dll" "$AD/SHFolder.dll"
         [ "${#install_keys[@]}" -eq 0 ] || check "browser sign-in" '"UnifiedLogin"="1"' "$BOTTLE_DIR/user.reg"
     fi
-    check "SteamAppId" 'SteamAppId: altium' "$BOTTLE_DIR/bottle.yml"
-    check "present-wait layer" "VK_ADD_IMPLICIT_LAYER_PATH: $STAGE/vulkan" "$BOTTLE_DIR/bottle.yml"
-    check "fd guard, XRandR and zero-size filters" "LD_PRELOAD: $PRELOAD" "$BOTTLE_DIR/bottle.yml"
+    check_env() { if bottle_has_env "$2" "$3"; then echo "    ok   $1"; else echo "    MISSING $1"; fi; }
+    check_env "SteamAppId" SteamAppId altium
+    check_env "present-wait layer" VK_ADD_IMPLICIT_LAYER_PATH "$STAGE/vulkan"
+    check_env "fd guard, XRandR and zero-size filters" LD_PRELOAD "$PRELOAD"
+    if [ -n "$AD" ] && [ "$BACKEND" = prefix ]; then
+        if [ -f "$DESKTOP_FILE" ]; then echo "    ok   launcher entry"; else echo "    MISSING launcher entry"; fi
+    fi
 fi
 
 echo
 if [ -z "$AD" ]; then
-    echo "The bottle is ready for the Altium Designer installer. Next: run the installer from"
-    echo "Bottles (README step 6), untick \"Run Altium Designer\" at the end, then run this"
-    echo "script again."
+    if [ "$BACKEND" = prefix ]; then
+        echo "The prefix is ready for the Altium Designer installer. Next: scripts/run.sh exe"
+        echo "<AltiumDesignerSetup...exe>, untick \"Run Altium Designer\" at the end, then run this"
+        echo "script again."
+    else
+        echo "The bottle is ready for the Altium Designer installer. Next: run the installer from"
+        echo "Bottles (README step 6), untick \"Run Altium Designer\" at the end, then run this"
+        echo "script again."
+    fi
     exit 0
 fi
 if [ "${#install_keys[@]}" -eq 0 ]; then
@@ -204,4 +241,8 @@ if [ "${#install_keys[@]}" -eq 0 ]; then
     echo "on. Start Altium once, close it, and run this script again (or enable"
     echo "System.UnifiedLogin under Preferences > System > General > Advanced)."
 fi
-echo "Done. Start Altium from Bottles."
+if [ "$BACKEND" = prefix ]; then
+    echo "Done. Start Altium from the application launcher, or with scripts/run.sh altium."
+else
+    echo "Done. Start Altium from Bottles."
+fi

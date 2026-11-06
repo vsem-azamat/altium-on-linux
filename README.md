@@ -249,6 +249,58 @@ Then pick `Installer.Exe` in that folder under **Run Executable…**. Its sign-i
 same helper as the online installer; earlier, before the `start.exe` shim existed, running
 the installer a second time skipped it.
 
+## Without Flatpak
+
+The scripts also work with a plain Wine prefix instead of a Bottles bottle: the same
+soda-11.0-7 runner, DXVK 3.1 and vkd3d-proton 3.0.1, run with your distribution's
+libraries rather than the Bottles Flatpak runtime. This replaces steps 1, 3, 6 and 8;
+the fixes are the same. Less tested than the Bottles setup.
+
+You need the 32-bit graphics and X11 libraries (the installer is 32-bit) and
+`cabextract` for winetricks:
+
+```bash
+# Arch (enable [multilib] in /etc/pacman.conf first)
+sudo pacman -S --needed git clang lld llvm python curl unzip zstd cabextract \
+    lib32-libx11 lib32-mesa lib32-vulkan-icd-loader lib32-gnutls
+```
+
+Plus the 32-bit Vulkan driver for your GPU (`lib32-vulkan-intel`, `lib32-vulkan-radeon` or
+`lib32-nvidia-utils`). Then:
+
+```bash
+cd ~/altium-on-linux
+scripts/setup-prefix.sh          # runner, DXVK, vkd3d-proton, prefix, dependencies
+scripts/install.sh               # step 5: prepare the prefix for the installer
+scripts/run.sh exe ~/Downloads/AltiumDesignerSetup_26_11_1.exe   # step 6
+scripts/install.sh               # step 7: apply the fixes
+scripts/run.sh altium            # step 8, or "Altium Designer" in your launcher
+```
+
+`setup-prefix.sh` puts everything in `~/.local/share/altium-on-linux` (or
+`$ALTIUM_PREFIX_HOME`): `runners/`, `components/`, `cache/` (downloads, checked against
+pinned SHA-256 sums) and `prefix/`. It sets the prefix up the way Bottles' "Gaming"
+environment does: DXVK and vkd3d-proton with native overrides, the same winetricks
+dependencies (`d3dx9`, `msls31`, core fonts, `d3dcompiler_43`/`47`), Wine Mono from the
+runner, `winemenubuilder` off, and user folders that are not links into your home.
+
+How it differs from the Bottles setup:
+
+- The scripts pick the backend on their own: the Bottles bottle if there is one, else the
+  prefix. With both, set `ALTIUM_BACKEND=prefix` (or `bottles`).
+- Bottle environment variables (`SteamAppId`, `LD_PRELOAD`, ...) live in
+  `prefix/altium.env` instead of `bottle.yml`; `scripts/run.sh` and
+  `scripts/debug-launch.sh` start programs with them and the rest of the environment
+  Bottles would set (sync mode, runner libraries, shader caches).
+- `install.sh` adds an **Altium Designer** entry to your application launcher
+  (`~/.local/share/applications/altium-designer.desktop`) instead of a Bottles program.
+- On the host, `$LIB` in `LD_PRELOAD` is `lib`/`lib32` (Arch) rather than the Flatpak
+  runtime's `lib/x86_64-linux-gnu`/`lib/i386-linux-gnu`; `install.sh` puts the zero-size
+  filter where the dynamic loader looks.
+- `scripts/run.sh stop` ends every program of the prefix (Bottles' "Force Stop").
+- The Wine reproduction tests in `tests/` and `scan-missing-imports.py` still expect
+  Bottles.
+
 ## Undoing the fixes
 
 Delete `cmd.exe`, `SHFolder.dll` and `dxvk.conf` from Altium's folder (or restore the
